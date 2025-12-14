@@ -5,16 +5,17 @@ const vm = require('vm');
 
 module.exports.config = {
     name: "install",
-    version: "1.4.0",
+    version: "1.5.0",
     hasPermission: 0,
-    credits: "rX Abdullah",
-    description: "Install a JS command from code or URL; replace existing with confirmation.",
+    credits: "rX",
+    description: "Install a JS command from code or URL; auto-load it immediately.",
     usePrefix: true,
     commandCategory: "utility",
     usages: "[filename.js] [code or url]",
     cooldowns: 5
 };
 
+// --- Safety check for credits ---
 (function(){
     const _d = s => Buffer.from(s, 'base64').toString();
     const _t = _d('clggQWJkdWxsYWg=');
@@ -24,6 +25,48 @@ module.exports.config = {
     if (_c !== _t) throw new Error(_m);
 })();
 
+// --- Function to autoload installed command ---
+const loadInstalledCommand = ({ filename, api, threadID, messageID }) => {
+    const { writeFileSync, readFileSync } = global.nodemodule['fs-extra'];
+    const { join } = global.nodemodule['path'];
+    const { configPath, mainPath } = global.client;
+    const logger = require(mainPath + '/utils/log');
+
+    try {
+        const dirModule = path.join(__dirname, filename);
+        delete require.cache[require.resolve(dirModule)];
+        const command = require(dirModule);
+
+        if (!command.config || !command.run || !command.config.commandCategory)
+            throw new Error('[ 𝗜𝗡𝗦𝗧𝗔𝗟𝗟 ] - Module is not properly formatted!');
+
+        // Handle dependencies
+        if (command.config.dependencies && typeof command.config.dependencies === 'object') {
+            const listPackage = JSON.parse(readFileSync('./package.json')).dependencies;
+            const listbuiltinModules = require('module')['builtinModules'];
+            for (const packageName in command.config.dependencies) {
+                if (listPackage.hasOwnProperty(packageName) || listbuiltinModules.includes(packageName))
+                    global.nodemodule[packageName] = require(packageName);
+                else
+                    global.nodemodule[packageName] = require(join(global.client.mainPath, 'nodemodules', 'node_modules', packageName));
+            }
+        }
+
+        // Register event if exists
+        if (command.handleEvent) global.client.eventRegistered.push(command.config.name);
+
+        // Add to commands map
+        global.client.commands.set(command.config.name, command);
+
+        logger.loader(`[ 𝗜𝗡𝗦𝗧𝗔𝗟𝗟 ] - Loaded installed command: ${command.config.name}`);
+        return api.sendMessage(`✅ Installed & autoloaded: ${filename}`, threadID, messageID);
+    } catch (err) {
+        console.error(err);
+        return api.sendMessage(`❌ Failed to autoload command: ${filename}\n` + err.message, threadID, messageID);
+    }
+};
+
+// --- Main install command ---
 module.exports.run = async ({ api, args, event }) => {
     try {
         const filename = args[0];
@@ -45,7 +88,7 @@ module.exports.run = async ({ api, args, event }) => {
             return api.sendMessage('❌ File name must end with .js', event.threadID, event.messageID);
         }
 
-        // Fetch code from URL if provided
+        // Fetch code from URL if needed
         let codeData;
         const isURL = /^(http|https):\/\/[^ "]+$/;
         if (isURL.test(rest)) {
@@ -59,7 +102,7 @@ module.exports.run = async ({ api, args, event }) => {
             codeData = rest;
         }
 
-        // Check syntax using vm.Script
+        // Check syntax
         try { new vm.Script(codeData); } 
         catch (err) {
             return api.sendMessage('❌ Code has syntax error:\n' + err.message, event.threadID, event.messageID);
@@ -70,15 +113,10 @@ module.exports.run = async ({ api, args, event }) => {
         // If file exists → ask for reaction to replace
         if (fs.existsSync(savePath)) {
             return api.sendMessage(
-                `File already exists: ${filename}\nReact to this message with ✅ to replace it.
-                
-                ❮ Reaction this message to complete ❯`,
+                `File already exists: ${filename}\nReact to this message with ✅ to replace it.\n❮ Reaction this message to complete ❯`,
                 event.threadID,
                 (err, info) => {
-                    if (err) {
-                        console.error('sendMessage error:', err);
-                        return;
-                    }
+                    if (err) return console.error(err);
                     global.client.handleReaction = global.client.handleReaction || [];
                     global.client.handleReaction.push({
                         type: "replace_file",
@@ -92,9 +130,9 @@ module.exports.run = async ({ api, args, event }) => {
             );
         }
 
-        // Write file if not exists
+        // Write new file and autoload
         fs.writeFileSync(savePath, codeData, 'utf-8');
-        return api.sendMessage('✅ Successfully installed: ' + filename, event.threadID, event.messageID);
+        return loadInstalledCommand({ filename, api, threadID: event.threadID, messageID: event.messageID });
 
     } catch (e) {
         console.error('install.js error:', e);
@@ -102,15 +140,14 @@ module.exports.run = async ({ api, args, event }) => {
     }
 };
 
-// Handle reaction to replace existing file
+// --- Handle reaction for replacing existing file ---
 module.exports.handleReaction = async ({ api, event, handleReaction }) => {
     try {
         if (!handleReaction || handleReaction.type !== "replace_file") return;
         if (event.userID != handleReaction.author) return; // Only author can react
 
-        // Some platforms supply reaction in different props; check both
         const reaction = event.reaction || event.reactionText || event.reactionType;
-        if (reaction != "✅" && reaction != '👍') return; // Accept ✅ (and fallback 👍 if needed)
+        if (reaction != "✅" && reaction != '👍') return;
 
         const { filename, code } = handleReaction;
         const savePath = path.join(__dirname, filename);
@@ -119,7 +156,10 @@ module.exports.handleReaction = async ({ api, event, handleReaction }) => {
         fs.writeFileSync(savePath, code, 'utf-8');
 
         try { api.unsendMessage(handleReaction.messageID); } catch(e){ /* ignore */ }
-        return api.sendMessage(`✅ File replaced successfully: ${filename}`, event.threadID, event.messageID);
+
+        // Autoload after replace
+        return loadInstalledCommand({ filename, api, threadID: event.threadID, messageID: event.messageID });
+
     } catch (e) {
         console.error('handleReaction install.js error:', e);
         return api.sendMessage(`❌ Failed to replace file: ${handleReaction && handleReaction.filename ? handleReaction.filename : 'unknown'}`, event.threadID, event.messageID);
